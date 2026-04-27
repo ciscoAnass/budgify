@@ -1,907 +1,933 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for
+from __future__ import annotations
+
+import copy
 import json
-import os
+import shutil
+import uuid
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, flash, redirect, render_template, request, send_file, url_for
 
 app = Flask(__name__)
+app.secret_key = "change-this-secret-key"
 
-# Data storage file
-DATA_FILE = 'invoice_data.json'
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_FILE = DATA_DIR / "budgify.json"
+BACKUP_DIR = DATA_DIR / "backups"
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+MONTH_NUMBER = {name: i + 1 for i, name in enumerate(MONTHS)}
+NUMBER_MONTH = {i + 1: name for i, name in enumerate(MONTHS)}
+
+DEFAULT_SECTIONS: list[dict[str, Any]] = [
+    # Income sections
+    {"id": "income-work-salary", "name": "Work Salary", "type": "income", "priority": "necessary", "monthly_budget": 0, "system": False},
+    {"id": "income-freelance", "name": "Freelance", "type": "income", "priority": "not_necessary", "monthly_budget": 0, "system": False},
+    {"id": "income-sell-product", "name": "Sell Product", "type": "income", "priority": "not_necessary", "monthly_budget": 0, "system": False},
+    {"id": "income-extra", "name": "Extra", "type": "income", "priority": "not_necessary", "monthly_budget": 0, "system": False},
+    {"id": "income-loan-return", "name": "Loan Return", "type": "income", "priority": "not_necessary", "monthly_budget": 0, "system": True},
+
+    # Expense sections
+    {"id": "expense-rent", "name": "Rent", "type": "expense", "priority": "necessary", "monthly_budget": 500, "system": False},
+    {"id": "expense-food", "name": "Food", "type": "expense", "priority": "necessary", "monthly_budget": 150, "system": False},
+    {"id": "expense-phone", "name": "Phone", "type": "expense", "priority": "necessary", "monthly_budget": 20, "system": False},
+    {"id": "expense-transport", "name": "Transport", "type": "expense", "priority": "necessary", "monthly_budget": 50, "system": False},
+    {"id": "expense-ai-subscription", "name": "AI Subscription", "type": "expense", "priority": "necessary", "monthly_budget": 20, "system": False},
+    {"id": "expense-go-out", "name": "Go Out", "type": "expense", "priority": "not_necessary", "monthly_budget": 100, "system": False},
+    {"id": "expense-festival", "name": "Festival", "type": "expense", "priority": "not_necessary", "monthly_budget": 0, "system": False},
+    {"id": "expense-tattoo", "name": "Tattoo", "type": "expense", "priority": "not_necessary", "monthly_budget": 0, "system": False},
+    {"id": "expense-loan-given", "name": "Loan Given", "type": "expense", "priority": "not_necessary", "monthly_budget": 0, "system": True},
+]
+
+DEFAULT_DATA: dict[str, Any] = {
+    "app_name": "Budgify",
+    "version": 3,
+    "settings": {"currency": "€"},
+    "savings_balance": 0.0,
+    "sections": DEFAULT_SECTIONS,
+    "years": {},
+    "loans": [],
+    "goals": [],
+    "savings_history": [],
+}
 
 
-# -----------------------
-# Data helpers
-# -----------------------
-def load_data():
-    """Load data from JSON file and ensure backward-compatible fields."""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            try:
-                data = json.load(f)
-            except json.JSONDecodeError:
-                data = {'outcomes': [], 'incomes': []}
-    else:
-        data = {'outcomes': [], 'incomes': []}
+def today_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
 
-    # Backfill defaults for old records so new features work without migration
-    for o in data.get('outcomes', []):
-        if 'monthly_limit' not in o:
-            o['monthly_limit'] = float(o.get('cost', 0) or 0)
-        if 'transactions' not in o:
-            o['transactions'] = []  # [{id, amount, date, note}]
-        # keep legacy 'status' if present; UI uses computed status
+
+def now_year_month() -> tuple[str, str]:
+    now = datetime.now()
+    return str(now.year), NUMBER_MONTH[now.month]
+
+
+def date_to_year_month(date_text: str | None) -> tuple[str, str]:
+    if not date_text:
+        return now_year_month()
+    try:
+        dt = datetime.strptime(date_text, "%Y-%m-%d")
+        return str(dt.year), NUMBER_MONTH[dt.month]
+    except ValueError:
+        return now_year_month()
+
+
+def money(value: Any) -> float:
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def normalize_type(section_type: str) -> str:
+    if section_type in {"outcome", "expense", "expenses"}:
+        return "expense"
+    return "income"
+
+
+def load_db() -> dict[str, Any]:
+    DATA_DIR.mkdir(exist_ok=True)
+    if not DATA_FILE.exists():
+        save_db(copy.deepcopy(DEFAULT_DATA))
+
+    with DATA_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    data = migrate_data(data)
     return data
 
 
-def save_data(data):
-    """Save data to JSON file"""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
+def save_db(data: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    tmp = DATA_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp.replace(DATA_FILE)
 
 
-def current_ym():
-    """Return current year-month string, e.g., '2025-09'"""
-    return datetime.now().strftime('%Y-%m')
+def migrate_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep old Budgify JSON files usable after this redesign."""
+    for key, value in DEFAULT_DATA.items():
+        data.setdefault(key, copy.deepcopy(value))
+
+    data["version"] = 3
+    data.setdefault("settings", {"currency": "€"})
+    data.setdefault("savings_balance", 0.0)
+    data.setdefault("years", {})
+    data.setdefault("loans", [])
+    data.setdefault("goals", [])
+    data.setdefault("savings_history", [])
+
+    # Normalize and add missing built-in sections without deleting user sections.
+    seen = {s.get("id") for s in data.get("sections", [])}
+    for section in data.get("sections", []):
+        section["type"] = normalize_type(section.get("type", "expense"))
+        section.setdefault("priority", "necessary")
+        section.setdefault("monthly_budget", 0)
+        section.setdefault("system", False)
+    for default_section in DEFAULT_SECTIONS:
+        if default_section["id"] not in seen:
+            data["sections"].append(copy.deepcopy(default_section))
+
+    for year, months in data.get("years", {}).items():
+        for month, month_data in months.items():
+            if "outcomes" in month_data and "expenses" not in month_data:
+                month_data["expenses"] = month_data.pop("outcomes")
+            ensure_month(data, str(year), month)
+            # Old v2 files could have per-month budget overrides.
+            # Budgets now live only in the global Sections page, so migrate them there.
+            old_budgets = month_data.get("sections", {}).pop("budgets", {})
+            for section_id, budget in old_budgets.items():
+                section = next((s for s in data.get("sections", []) if s.get("id") == section_id), None)
+                if section and section.get("type") == "expense" and money(budget) > 0:
+                    section["monthly_budget"] = money(budget)
+
+    for loan in data.get("loans", []):
+        original = money(loan.get("original_amount", loan.get("amount", 0)))
+        loan["original_amount"] = original
+        loan.setdefault("payments", [])
+        paid = sum(money(p.get("amount")) for p in loan.get("payments", []))
+        if not loan.get("payments") and loan.get("status") == "paid":
+            paid = original
+        loan["paid_amount"] = round(paid, 2)
+        loan["remaining_amount"] = max(round(original - paid, 2), 0.0)
+        loan["status"] = loan_status(loan)
+
+    return data
 
 
-def sum_income(data):
-    return sum(float(i.get('amount', 0) or 0) for i in data.get('incomes', []))
+def ensure_month(data: dict[str, Any], year: str, month: str) -> dict[str, Any]:
+    data.setdefault("years", {})
+    data["years"].setdefault(str(year), {})
+    data["years"][str(year)].setdefault(month, {})
+    month_data = data["years"][str(year)][month]
+    month_data.setdefault("incomes", [])
+    month_data.setdefault("expenses", [])
+    month_data.setdefault("savings", [])
+    month_data.setdefault("loans", [])
+    month_data.setdefault("goals", [])
+    month_data.setdefault("sections", {})
+    month_data["sections"].setdefault("active_optional", [])
+    return month_data
 
 
-def sum_outcome_costs(data):
-    # Legacy "cost" sum (kept for your original totals & net balance)
-    return sum(float(o.get('cost', 0) or 0) for o in data.get('outcomes', []))
+def section_by_id(data: dict[str, Any], section_id: str) -> dict[str, Any] | None:
+    return next((s for s in data.get("sections", []) if s.get("id") == section_id), None)
 
 
-def sum_monthly_limits(data):
-    return sum(float(o.get('monthly_limit', 0) or 0) for o in data.get('outcomes', []))
+def section_name(data: dict[str, Any], section_id: str) -> str:
+    section = section_by_id(data, section_id)
+    return section.get("name", "Unknown") if section else "Unknown"
 
 
-def spent_this_month_for_outcome(o, ym=None):
-    """Sum of transactions for an outcome in the current month."""
-    ym = ym or current_ym()
-    total = 0.0
-    for t in o.get('transactions', []):
-        # t['date'] format: 'YYYY-MM-DD HH:MM:SS'
-        if str(t.get('date', '')).startswith(ym):
-            total += float(t.get('amount', 0) or 0)
-    return total
+def activate_section_for_month(data: dict[str, Any], year: str, month: str, section_id: str) -> None:
+    month_data = ensure_month(data, year, month)
+    section = section_by_id(data, section_id)
+    if not section:
+        return
+    active = month_data["sections"].setdefault("active_optional", [])
+    if section.get("priority") == "not_necessary" and section_id not in active:
+        active.append(section_id)
 
 
-def spent_this_month_total(data):
-    ym = current_ym()
-    return sum(spent_this_month_for_outcome(o, ym) for o in data.get('outcomes', []))
+def entries_for_section(month_data: dict[str, Any], entry_type: str, section_id: str) -> list[dict[str, Any]]:
+    key = "incomes" if entry_type == "income" else "expenses"
+    return [e for e in month_data.get(key, []) if e.get("section_id") == section_id]
 
 
-def compute_auto_status(spent: float, limit: float) -> str:
-    """Derive status from spending vs budget."""
-    eps = 1e-6
-    if spent <= eps:
-        return "Pending"
-    if limit <= eps:
-        # No limit but there is spend
-        return "In Course"
-    if spent + eps < limit:
-        return "In Course"
-    if abs(spent - limit) <= eps:
-        return "Paid"
-    return "Over"
+def section_has_entries(month_data: dict[str, Any], section_id: str) -> bool:
+    return bool(entries_for_section(month_data, "income", section_id) or entries_for_section(month_data, "expense", section_id))
 
 
-# -----------------------
-# Routes
-# -----------------------
-@app.route('/')
-def index():
-    """Main dashboard page"""
-    data = load_data()
+def sections_for_month(data: dict[str, Any], year: str, month: str, section_type: str) -> list[dict[str, Any]]:
+    month_data = ensure_month(data, year, month)
+    active = set(month_data.get("sections", {}).get("active_optional", []))
+    result = []
+    for section in data.get("sections", []):
+        if section.get("type") != section_type:
+            continue
+        is_visible = (
+            section.get("priority") == "necessary"
+            or section.get("id") in active
+            or section_has_entries(month_data, section.get("id"))
+        )
+        if is_visible:
+            result.append(section)
+    return sorted(result, key=lambda s: (s.get("priority") != "necessary", s.get("name", "")))
 
-    # Original summary (legacy totals)
-    total_income = sum_income(data)
-    total_outcomes = sum_outcome_costs(data)
-    net_balance = total_income - total_outcomes
 
-    # New budget summary (per-month)
-    total_monthly_budget = sum_monthly_limits(data)
-    total_spent_month = spent_this_month_total(data)
-    total_remaining_month = max(total_monthly_budget - total_spent_month, 0)
+def inactive_optional_sections(data: dict[str, Any], year: str, month: str, section_type: str | None = None) -> list[dict[str, Any]]:
+    month_data = ensure_month(data, year, month)
+    active = set(month_data.get("sections", {}).get("active_optional", []))
+    visible_ids = {s["id"] for t in ("income", "expense") for s in sections_for_month(data, year, month, t)}
+    result = []
+    for section in data.get("sections", []):
+        if section_type and section.get("type") != section_type:
+            continue
+        if section.get("priority") != "not_necessary":
+            continue
+        if section.get("id") in active or section.get("id") in visible_ids:
+            continue
+        result.append(section)
+    return sorted(result, key=lambda s: (s.get("type", ""), s.get("name", "")))
 
-    # Per-outcome computed fields for the view
-    ym = current_ym()
-    for o in data['outcomes']:
-        o['_spent_month'] = spent_this_month_for_outcome(o, ym)
-        o['_remaining_month'] = max(float(o.get('monthly_limit', 0)) - o['_spent_month'], 0)
 
-        limit = float(o.get('monthly_limit', 0) or 0)
-        o['_status'] = compute_auto_status(o['_spent_month'], limit)
+def budget_for_section(data: dict[str, Any], year: str, month: str, section: dict[str, Any]) -> float:
+    # Budgets are managed globally in the Sections page.
+    # The Month page only shows the budget; it does not edit it.
+    return money(section.get("monthly_budget", 0))
 
-        if limit <= 0:
-            o['_budget_state'] = 'no-limit'
-            o['_pct_used'] = 0.0
+
+def build_section_cards(data: dict[str, Any], year: str, month: str, section_type: str) -> list[dict[str, Any]]:
+    month_data = ensure_month(data, year, month)
+    cards = []
+    for section in sections_for_month(data, year, month, section_type):
+        key = "incomes" if section_type == "income" else "expenses"
+        entries = [e for e in month_data.get(key, []) if e.get("section_id") == section.get("id")]
+        entries = sorted(entries, key=lambda e: e.get("date", ""), reverse=True)
+        total = round(sum(money(e.get("amount")) for e in entries), 2)
+        budget = budget_for_section(data, year, month, section) if section_type == "expense" else 0.0
+        remaining = round(budget - total, 2) if budget else None
+        over_budget = bool(budget and total > budget)
+        cards.append({
+            "section": section,
+            "entries": entries,
+            "total": total,
+            "budget": budget,
+            "remaining": remaining,
+            "over_budget": over_budget,
+            "over_amount": round(total - budget, 2) if over_budget else 0.0,
+        })
+    return cards
+
+
+def calc_month(data: dict[str, Any], year: str, month: str) -> dict[str, float]:
+    month_data = ensure_month(data, year, month)
+    income = sum(money(x.get("amount")) for x in month_data.get("incomes", []))
+    expenses_monthly = sum(money(x.get("amount")) for x in month_data.get("expenses", []) if x.get("source", "monthly") == "monthly")
+    expenses_savings = sum(money(x.get("amount")) for x in month_data.get("expenses", []) if x.get("source") == "savings")
+    saved_from_month = sum(money(x.get("amount")) for x in month_data.get("savings", []) if x.get("kind") == "add_from_monthly")
+    withdrawn_to_month = sum(money(x.get("amount")) for x in month_data.get("savings", []) if x.get("kind") == "withdraw_to_month")
+    remaining = income + withdrawn_to_month - expenses_monthly - saved_from_month
+    return {
+        "income": round(income, 2),
+        "expenses": round(expenses_monthly, 2),
+        "expenses_from_savings": round(expenses_savings, 2),
+        "saved_from_month": round(saved_from_month, 2),
+        "withdrawn_to_month": round(withdrawn_to_month, 2),
+        "remaining": round(remaining, 2),
+    }
+
+
+def active_loans(data: dict[str, Any]) -> list[dict[str, Any]]:
+    refresh_all_loans(data)
+    return [l for l in data.get("loans", []) if l.get("status") in {"active", "partial"}]
+
+
+def total_active_loan_remaining(data: dict[str, Any]) -> float:
+    return round(sum(money(l.get("remaining_amount")) for l in active_loans(data)), 2)
+
+
+def loan_status(loan: dict[str, Any]) -> str:
+    original = money(loan.get("original_amount", loan.get("amount", 0)))
+    paid = sum(money(p.get("amount")) for p in loan.get("payments", []))
+    if paid <= 0:
+        return "active"
+    if paid >= original:
+        return "paid"
+    return "partial"
+
+
+def refresh_loan(loan: dict[str, Any]) -> dict[str, Any]:
+    original = money(loan.get("original_amount", loan.get("amount", 0)))
+    paid = round(sum(money(p.get("amount")) for p in loan.get("payments", [])), 2)
+    loan["original_amount"] = original
+    loan["paid_amount"] = min(paid, original) if original else paid
+    loan["remaining_amount"] = max(round(original - paid, 2), 0.0)
+    loan["status"] = loan_status(loan)
+    if loan["status"] == "paid" and loan.get("payments"):
+        loan["paid_date"] = loan["payments"][-1].get("date")
+    return loan
+
+
+def refresh_all_loans(data: dict[str, Any]) -> None:
+    for loan in data.get("loans", []):
+        refresh_loan(loan)
+
+
+def chart_payload(data: dict[str, Any], year: str) -> dict[str, Any]:
+    income_values, expense_values, remaining_values, savings_values = [], [], [], []
+    for m in MONTHS:
+        stats = calc_month(data, year, m)
+        income_values.append(stats["income"])
+        expense_values.append(stats["expenses"])
+        remaining_values.append(stats["remaining"])
+        savings_values.append(stats["saved_from_month"])
+    return {"months": MONTHS, "income": income_values, "expenses": expense_values, "remaining": remaining_values, "saved": savings_values}
+
+
+def priority_spending(data: dict[str, Any], year: str, month: str) -> dict[str, float]:
+    month_data = ensure_month(data, year, month)
+    section_map = {s["id"]: s for s in data.get("sections", [])}
+    necessary = 0.0
+    optional = 0.0
+    for expense in month_data.get("expenses", []):
+        if expense.get("source") == "savings":
+            continue
+        section = section_map.get(expense.get("section_id"), {})
+        if section.get("priority") == "necessary":
+            necessary += money(expense.get("amount"))
         else:
-            pct = (o['_spent_month'] / limit) * 100.0
-            o['_pct_used'] = round(pct, 2)
-            if pct < 70:
-                o['_budget_state'] = 'ok'
-            elif pct <= 100:
-                o['_budget_state'] = 'near'
-            else:
-                o['_budget_state'] = 'over'
-        o['_pct_capped'] = min(o['_pct_used'], 100.0)
+            optional += money(expense.get("amount"))
+    return {"Necessary": round(necessary, 2), "Not necessary": round(optional, 2)}
 
+
+def best_worst_month(data: dict[str, Any], year: str) -> dict[str, Any]:
+    values = [(month, calc_month(data, year, month)["remaining"]) for month in MONTHS]
+    best = max(values, key=lambda x: x[1])
+    worst = min(values, key=lambda x: x[1])
+    return {"best": {"month": best[0], "amount": best[1]}, "worst": {"month": worst[0], "amount": worst[1]}}
+
+
+def recent_entries(data: dict[str, Any], year: str, month: str, limit: int = 6) -> list[dict[str, Any]]:
+    month_data = ensure_month(data, year, month)
+    items = []
+    for entry in month_data.get("incomes", []):
+        e = copy.deepcopy(entry)
+        e["kind"] = "Income"
+        items.append(e)
+    for entry in month_data.get("expenses", []):
+        e = copy.deepcopy(entry)
+        e["kind"] = "Expense"
+        items.append(e)
+    return sorted(items, key=lambda e: e.get("date", ""), reverse=True)[:limit]
+
+
+def create_entry(
+    data: dict[str, Any],
+    year: str,
+    month: str,
+    entry_type: str,
+    section_id: str,
+    amount: float,
+    title: str,
+    date: str | None = None,
+    notes: str = "",
+    source: str = "monthly",
+    linked_type: str | None = None,
+    linked_id: str | None = None,
+) -> dict[str, Any]:
+    month_data = ensure_month(data, year, month)
+    section = section_by_id(data, section_id)
+    if not section:
+        raise ValueError("Unknown section")
+
+    activate_section_for_month(data, year, month, section_id)
+    entry = {
+        "id": new_id(),
+        "section_id": section_id,
+        "section_name": section.get("name"),
+        "title": title or section.get("name"),
+        "amount": money(amount),
+        "date": date or today_iso(),
+        "notes": notes or "",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if linked_type:
+        entry["linked_type"] = linked_type
+    if linked_id:
+        entry["linked_id"] = linked_id
+
+    if entry_type == "income":
+        month_data["incomes"].append(entry)
+    else:
+        entry["source"] = source or "monthly"
+        month_data["expenses"].append(entry)
+        if entry["source"] == "savings":
+            data["savings_balance"] = round(money(data.get("savings_balance")) - entry["amount"], 2)
+    return entry
+
+
+def add_savings_history(data: dict[str, Any], year: str, month: str, kind: str, amount: float, note: str, date: str, section_id: str | None = None) -> dict[str, Any]:
+    month_data = ensure_month(data, year, month)
+    item = {
+        "id": new_id(),
+        "kind": kind,
+        "amount": money(amount),
+        "note": note,
+        "date": date,
+        "year": year,
+        "month": month,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if section_id:
+        item["section_id"] = section_id
+    month_data["savings"].append(item)
+    data.setdefault("savings_history", []).append(copy.deepcopy(item))
+    return item
+
+
+@app.context_processor
+def inject_globals() -> dict[str, Any]:
+    data = load_db()
+    return {
+        "months": MONTHS,
+        "currency": data.get("settings", {}).get("currency", "€"),
+        "current_year": now_year_month()[0],
+        "current_month": now_year_month()[1],
+        "today": today_iso(),
+    }
+
+
+@app.route("/")
+def dashboard():
+    data = load_db()
+    year = request.args.get("year") or now_year_month()[0]
+    month = request.args.get("month") or now_year_month()[1]
+    ensure_month(data, year, month)
+    refresh_all_loans(data)
+    stats = calc_month(data, year, month)
+    loans_active = active_loans(data)
+    total_remaining_loans = total_active_loan_remaining(data)
+    chart_data = chart_payload(data, year)
+    priority_data = priority_spending(data, year, month)
+    cards_income = build_section_cards(data, year, month, "income")
+    cards_expense = build_section_cards(data, year, month, "expense")
+    over_budget_cards = [c for c in cards_expense if c["over_budget"]]
+    goals = data.get("goals", [])[:4]
+    save_db(data)
     return render_template(
-        'dashboard.html',
-        outcomes=data['outcomes'],
-        incomes=data['incomes'],
-        total_income=total_income,
-        total_outcomes=total_outcomes,
-        net_balance=net_balance,
-        total_monthly_budget=total_monthly_budget,
-        total_spent_month=total_spent_month,
-        total_remaining_month=total_remaining_month,
-        current_year_month=ym
+        "dashboard.html",
+        data=data,
+        year=year,
+        month=month,
+        stats=stats,
+        active_loans=loans_active,
+        total_remaining_loans=total_remaining_loans,
+        chart_data=chart_data,
+        priority_data=priority_data,
+        income_cards=cards_income,
+        expense_cards=cards_expense,
+        over_budget_cards=over_budget_cards,
+        recent_entries=recent_entries(data, year, month),
+        goals=goals,
+        best_worst=best_worst_month(data, year),
     )
 
 
-@app.route('/add_outcome', methods=['POST'])
-def add_outcome():
-    """Add a new outcome (expense bucket) with optional monthly limit"""
-    data = load_data()
-
-    monthly_limit = request.form.get('monthly_limit', '').strip()
-    try:
-        monthly_limit = float(monthly_limit) if monthly_limit != '' else 0.0
-    except ValueError:
-        monthly_limit = 0.0
-
-    outcome = {
-        'id': (max([o['id'] for o in data['outcomes']], default=0) + 1),
-        'name': request.form['name'],
-        'cost': float(request.form.get('cost', 0) or 0),  # legacy field (kept)
-        'monthly_limit': monthly_limit,
-        'status': 'Pending',  # stored for backward compat; UI computes display
-        'date_added': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'transactions': []
-    }
-
-    data['outcomes'].append(outcome)
-    save_data(data)
-    return redirect(url_for('index'))
-
-
-@app.route('/add_income', methods=['POST'])
-def add_income():
-    """Add a new income"""
-    data = load_data()
-    income = {
-        'id': (max([i['id'] for i in data['incomes']], default=0) + 1),
-        'name': request.form['name'],
-        'amount': float(request.form['amount']),
-        'date_added': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    data['incomes'].append(income)
-    save_data(data)
-    return redirect(url_for('index'))
+@app.route("/month")
+def month_tracking():
+    data = load_db()
+    year = request.args.get("year") or now_year_month()[0]
+    month = request.args.get("month") or now_year_month()[1]
+    ensure_month(data, year, month)
+    stats = calc_month(data, year, month)
+    income_cards = build_section_cards(data, year, month, "income")
+    expense_cards = build_section_cards(data, year, month, "expense")
+    optional_income = inactive_optional_sections(data, year, month, "income")
+    optional_expense = inactive_optional_sections(data, year, month, "expense")
+    save_db(data)
+    return render_template(
+        "month.html",
+        data=data,
+        year=year,
+        month=month,
+        stats=stats,
+        income_cards=income_cards,
+        expense_cards=expense_cards,
+        optional_income=optional_income,
+        optional_expense=optional_expense,
+    )
 
 
-@app.route('/update_outcome_cost', methods=['POST'])
-def update_outcome_cost():
-    """Update legacy outcome cost"""
-    data = load_data()
-    outcome_id = int(request.form['outcome_id'])
-    new_cost = float(request.form['cost'])
+@app.post("/entries/add")
+def add_entry():
+    data = load_db()
+    year = request.form.get("year") or now_year_month()[0]
+    month = request.form.get("month") or now_year_month()[1]
+    entry_type = normalize_type(request.form.get("entry_type", "expense"))
+    if request.form.get("entry_type") == "income":
+        entry_type = "income"
+    section_id = request.form.get("section_id", "")
+    amount = money(request.form.get("amount"))
+    title = request.form.get("title", "")
+    date = request.form.get("date") or today_iso()
+    notes = request.form.get("notes", "")
+    source = request.form.get("source", "monthly")
 
-    for outcome in data['outcomes']:
-        if outcome['id'] == outcome_id:
-            outcome['cost'] = new_cost
+    if amount <= 0:
+        flash("Please enter an amount bigger than 0.", "error")
+        return redirect(request.referrer or url_for("month_tracking", year=year, month=month))
+
+    section = section_by_id(data, section_id)
+    if not section:
+        flash("Please choose a valid section.", "error")
+        return redirect(request.referrer or url_for("month_tracking", year=year, month=month))
+
+    if section.get("type") == "income":
+        create_entry(data, year, month, "income", section_id, amount, title, date, notes)
+        flash(f"Income added to {section.get('name')}.", "success")
+    else:
+        create_entry(data, year, month, "expense", section_id, amount, title, date, notes, source=source)
+        flash(f"Expense added to {section.get('name')}.", "success")
+    save_db(data)
+    return redirect(url_for("month_tracking", year=year, month=month))
+
+
+@app.post("/entries/<entry_type>/<entry_id>/delete")
+def delete_entry(entry_type: str, entry_id: str):
+    data = load_db()
+    year = request.form.get("year") or now_year_month()[0]
+    month = request.form.get("month") or now_year_month()[1]
+    month_data = ensure_month(data, year, month)
+    key = "incomes" if entry_type == "income" else "expenses"
+    items = month_data.get(key, [])
+    for item in list(items):
+        if item.get("id") == entry_id:
+            if key == "expenses" and item.get("source") == "savings":
+                data["savings_balance"] = round(money(data.get("savings_balance")) + money(item.get("amount")), 2)
+            items.remove(item)
+            flash("Entry deleted.", "success")
             break
-
-    save_data(data)
-    return jsonify({'success': True})
-
-
-@app.route('/update_income_amount', methods=['POST'])
-def update_income_amount():
-    """Update income amount"""
-    data = load_data()
-    income_id = int(request.form['income_id'])
-    new_amount = float(request.form['amount'])
-
-    for income in data['incomes']:
-        if income['id'] == income_id:
-            income['amount'] = new_amount
-            break
-
-    save_data(data)
-    return jsonify({'success': True})
-
-
-@app.route('/update_monthly_limit', methods=['POST'])
-def update_monthly_limit():
-    """Update an outcome's monthly limit (budget)"""
-    data = load_data()
-    outcome_id = int(request.form['outcome_id'])
-    new_limit = float(request.form.get('monthly_limit', 0) or 0)
-
-    for outcome in data['outcomes']:
-        if outcome['id'] == outcome_id:
-            outcome['monthly_limit'] = new_limit
-            break
-
-    save_data(data)
-    return jsonify({'success': True})
-
-
-@app.route('/add_transaction', methods=['POST'])
-def add_transaction():
-    """Add a spend entry to an outcome"""
-    data = load_data()
-    outcome_id = int(request.form['outcome_id'])
-    amount = float(request.form.get('amount', 0) or 0)
-    note = request.form.get('note', '').strip()
-
-    for outcome in data['outcomes']:
-        if outcome['id'] == outcome_id:
-            next_id = (max([t['id'] for t in outcome.get('transactions', [])], default=0) + 1)
-            outcome['transactions'].append({
-                'id': next_id,
-                'amount': amount,
-                'note': note,
-                'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            })
-            break
-
-    save_data(data)
-    return redirect(url_for('index'))
-
-
-@app.route('/delete_transaction/<int:outcome_id>/<int:txn_id>', methods=['POST'])
-def delete_transaction(outcome_id, txn_id):
-    """Delete a spend entry from an outcome"""
-    data = load_data()
-    for outcome in data['outcomes']:
-        if outcome['id'] == outcome_id:
-            outcome['transactions'] = [t for t in outcome.get('transactions', []) if t['id'] != txn_id]
-            break
-    save_data(data)
-    return redirect(url_for('index'))
-
-
-@app.route('/delete_outcome/<int:outcome_id>', methods=['POST'])
-def delete_outcome(outcome_id):
-    """Delete an outcome"""
-    data = load_data()
-    data['outcomes'] = [o for o in data['outcomes'] if o['id'] != outcome_id]
-    save_data(data)
-    return redirect(url_for('index'))
-
-
-@app.route('/delete_income/<int:income_id>', methods=['POST'])
-def delete_income(income_id):
-    """Delete an income"""
-    data = load_data()
-    data['incomes'] = [i for i in data['incomes'] if i['id'] != income_id]
-    save_data(data)
-    return redirect(url_for('index'))
-
-
-# -----------------------
-# App bootstrap + template
-# -----------------------
-if __name__ == '__main__':
-    # Create templates directory if it doesn't exist
-    if not os.path.exists('templates'):
-        os.makedirs('templates')
-
-    # Minimalist, modern template (UTF-8 write)
-    template_content = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>budgify</title>
-
-  <!-- Inter font -->
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-
-  <!-- Minimal icons -->
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
-
-  <style>
-/* =========================
-   Design Tokens
-   ========================= */
-:root{
-  /* Core palette */
-  --bg: #f6f7f8;         /* app background (neutral) */
-  --surface: #ffffff;    /* cards / nav / modals */
-  --text: #0f172a;       /* primary text (very dark gray) */
-  --muted: #6b7280;      /* secondary text */
-  --border: #e5e7eb;     /* subtle borders */
-
-  /* Brand */
-  --primary: #2563eb;    /* primary blue */
-  --accent:  #f59e0b;    /* accent amber */
-
-  /* Semantic (for status) */
-  --ok:       #22c55e;   /* OK/Success */
-  --near:     #f59e0b;   /* Near limit */
-  --over:     #ef4444;   /* Over */
-  --pending:  #9ca3af;   /* Pending (neutral) */
-
-  /* Status tints (backgrounds) */
-  --ok-bg:      #ecfdf5;
-  --near-bg:    #fff7ed;
-  --over-bg:    #fef2f2;
-  --pending-bg: #f4f5f7;
-
-  /* Elevation & radii */
-  --radius-lg: 14px;
-  --radius-md: 12px;
-  --radius-sm: 10px;
-  --shadow-md: 0 8px 24px rgba(17,24,39,.06);
-  --shadow-sm: 0 2px 10px rgba(17,24,39,.06);
-  --focus:     0 0 0 3px rgba(37,99,235,.25);
-}
-
-/* Global reset & typography */
-*{ box-sizing: border-box; }
-html,body{ height: 100%; }
-body{
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-/* Layout shells */
-.wrap{ max-width: 1200px; margin: 0 auto; padding: 16px; }
-header{
-  position: sticky; top: 0; z-index: 10;
-  background: var(--bg);
-  border-bottom: 1px solid var(--border);
-  backdrop-filter: saturate(180%) blur(8px);
-}
-.nav{
-  display:flex; align-items:center; justify-content:space-between;
-  gap: 12px; padding: 14px 0;
-}
-.brand{ display:flex; align-items:center; gap: 10px; }
-.brand i{ color: var(--primary); }
-.brand h1{ font-size: 18px; font-weight: 700; margin: 0; letter-spacing: .2px; }
-.meta{ color: var(--muted); font-size: 14px; }
-
-/* Main sections */
-main{ padding: 18px 0; display: grid; gap: 16px; }
-
-/* =========================
-   Summary (stats)
-   ========================= */
-.summary{
-  display:grid; gap: 12px;
-  grid-template-columns: repeat(2,minmax(0,1fr));
-}
-@media (min-width: 720px){
-  .summary{ grid-template-columns: repeat(3,minmax(0,1fr)); }
-}
-@media (min-width: 1120px){
-  .summary{ grid-template-columns: repeat(6,minmax(0,1fr)); }
-}
-.stat{
-  background: var(--surface);
-  border:1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 14px;
-  box-shadow: var(--shadow-sm);
-}
-.stat .label{ color: var(--muted); font-size: 12px; margin-bottom: 6px; display:flex; align-items:center; gap:8px; }
-.stat .label i{ color: var(--primary); }
-.stat .value{ font-size: 18px; font-weight: 700; }
-
-/* =========================
-   Two-column layout
-   ========================= */
-.columns{
-  display:grid; gap: 16px;
-  grid-template-columns: 1fr;
-}
-@media (min-width: 980px){
-  .columns{ grid-template-columns: 1.25fr .75fr; }
-}
-
-/* =========================
-   Cards
-   ========================= */
-.card{
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
-}
-.card-header{
-  padding: 16px 18px; border-bottom: 1px solid var(--border);
-  display:flex; align-items:center; justify-content:space-between; gap:12px;
-}
-.card-header h2{ font-size: 16px; font-weight: 700; margin: 0; letter-spacing:.2px; }
-.card-body{ padding: 16px 18px; }
-
-/* =========================
-   Lists & Items
-   ========================= */
-.list{ display:flex; flex-direction:column; gap:12px; }
-.item{
-  border:1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px;
-  display:flex; flex-direction:column; gap:12px;
-  transition: box-shadow .2s ease, transform .06s ease, border-color .2s ease;
-  background: var(--surface);
-}
-.item:hover{ box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-.item-head{
-  display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap: wrap;
-}
-.item-title{ font-weight:700; font-size: 15px; }
-.muted{ color: var(--muted); font-size: 13px; }
-
-/* =========================
-   STATUS-STYLED EXPENSES
-   (card background & border accents)
-   ========================= */
-/* Pending (spent == 0) */
-.item.pending{
-  background: var(--pending-bg);
-  border-color: #dfe3e8;
-  box-shadow: inset 0 0 0 2px rgba(156,163,175,.15);
-}
-
-/* In Course (0 < spent < limit) */
-.item.in-course{
-  background: var(--near-bg);
-  border-color: #f3d7b3;
-  box-shadow: inset 0 0 0 2px rgba(245,158,11,.18);
-}
-
-/* Paid (spent == limit) */
-.item.paid{
-  background: var(--ok-bg);
-  border-color: #bfead4;
-  box-shadow: inset 0 0 0 2px rgba(34,197,94,.18);
-}
-
-/* Over (spent > limit) */
-.item.over{
-  background: var(--over-bg);
-  border-color: #f5c2c2;
-  box-shadow: inset 0 0 0 2px rgba(239,68,68,.18);
-}
-
-/* Subtle left accent bar for quick scanning */
-.item.pending::before,
-.item.in-course::before,
-.item.paid::before,
-.item.over::before{
-  content:"";
-  display:block;
-  position:relative;
-  width: 6px; height: 100%;
-  border-radius: 6px;
-  margin-right: 10px;
-  background: transparent;
-  flex: 0 0 6px;
-}
-.item.pending{ display:flex; }
-.item.in-course{ display:flex; }
-.item.paid{ display:flex; }
-.item.over{ display:flex; }
-
-.item.pending::before{ background: var(--pending); opacity: .28; }
-.item.in-course::before{ background: var(--near); opacity: .28; }
-.item.paid::before{ background: var(--ok); opacity: .28; }
-.item.over::before{ background: var(--over); opacity: .28; }
-
-/* Keep content aligned after the accent bar */
-.item > *:not(:first-child){ /* no-op, placeholder in case of future tweaks */ }
-
-/* =========================
-   Budget Row (grid inside item)
-   ========================= */
-.budget{
-  display:grid; gap: 10px;
-  grid-template-columns: repeat(5,minmax(0,1fr));
-  align-items:center;
-}
-@media (max-width: 720px){
-  .budget{ grid-template-columns: 1fr 1fr; }
-}
-.label{ font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-
-/* Badges */
-.badge{
-  display:inline-block; padding: 6px 10px; border-radius: 999px;
-  font-size: 12px; font-weight: 700; border: 1px solid var(--border); background: #f9fafb;
-}
-.badge.ok   { color: var(--ok); }
-.badge.near { color: var(--near); }
-.badge.over { color: var(--over); }
-.badge.nolimit{ color: var(--muted); }
-.badge.status{ color: var(--text); }
-
-/* Progress */
-.progress{ width:100%; height:10px; background:#eef2f7; border-radius:999px; overflow:hidden; }
-.progress > div{ height:100%; width:0; background: var(--primary); transition: width .4s ease; }
-.progress.near > div{ background: var(--accent); }
-.progress.over > div{ background: var(--over); }
-
-/* =========================
-   Controls (buttons & inline numbers)
-   ========================= */
-.row{ display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-
-.btn{
-  appearance:none; -webkit-appearance:none;
-  border:1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  padding: 10px 14px;
-  border-radius: var(--radius-sm);
-  font-weight: 700;
-  cursor: pointer;
-  transition: transform .06s ease, box-shadow .2s ease, border-color .2s ease, background .2s ease, color .2s ease;
-}
-.btn:hover{ box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-.btn:focus-visible{ outline: none; box-shadow: var(--focus); }
-.btn-primary{
-  background: var(--primary);
-  color: #fff;
-  border-color: var(--primary);
-}
-.btn-primary:hover{ filter: brightness(0.98); }
-.btn-danger{
-  color:#fff; background: var(--over); border-color: var(--over);
-}
-.btn-tonal{
-  background:#f9fafb; border-color: var(--border);
-}
-.btn-sm{ padding: 8px 10px; font-size: 13px; border-radius: 8px; }
-
-.num-inline{
-  background: transparent; border: 1px dashed transparent;
-  font-weight: 800; text-align: right; width: 120px; letter-spacing:.2px;
-}
-.num-inline.cost{ color: var(--over); }
-.num-inline.amount{ color: var(--ok); }
-.num-inline.limit{ color: var(--primary); }
-.num-inline:focus{ outline: none; border-color: var(--primary); background: #fff; }
-
-/* =========================
-   Forms / Inputs
-   ========================= */
-.field{ display:flex; flex-direction:column; gap:6px; }
-.input{
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: #fff;
-  font: inherit;
-}
-.input:focus{ outline: none; box-shadow: var(--focus); }
-
-/* =========================
-   Modals
-   ========================= */
-.modal{ display:none; position:fixed; inset:0; z-index:1000; background: rgba(0,0,0,.35); }
-.modal-content{
-  position:absolute; left:50%; top:50%; transform: translate(-50%,-50%);
-  width: min(560px, 94vw);
-  background: var(--surface); border:1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-md);
-  padding: 18px;
-}
-.modal-header{ display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; }
-.close{ cursor:pointer; border:none; background: transparent; font-size: 20px; color: var(--muted); }
-.close:hover{ color: var(--text); }
-
-/* =========================
-   Utilities
-   ========================= */
-.hidden{ display:none!important; }
-[disabled]{ opacity:.6; pointer-events:none; }
-
-/* prefers-reduced-motion for accessibility */
-@media (prefers-reduced-motion: reduce) {
-  .btn, .item, .progress > div{ transition: none !important; }
-}
-
-  </style>
-</head>
-<body>
-  <header>
-    <div class="wrap">
-      <nav class="nav" aria-label="Primary">
-        <div class="brand">
-          <i class="fa-solid fa-chart-line"></i>
-          <h1>budgify</h1>
-        </div>
-        <div class="meta">Month: <strong>{{ current_year_month }}</strong></div>
-      </nav>
-    </div>
-  </header>
-
-  <main>
-    <div class="wrap">
-      <!-- Summary -->
-      <section class="summary" aria-label="Summary">
-        <div class="stat">
-          <div class="label"><i class="fa-solid fa-arrow-up"></i>Total Income</div>
-          <div class="value">${{ "%.2f"|format(total_income) }}</div>
-          <div class="muted">{{ incomes|length }} income sources</div>
-        </div>
-        <div class="stat">
-          <div class="label"><i class="fa-solid fa-arrow-down"></i>Total Expenses (legacy)</div>
-          <div class="value">${{ "%.2f"|format(total_outcomes) }}</div>
-          <div class="muted">{{ outcomes|length }} expenses tracked</div>
-        </div>
-        <div class="stat">
-          <div class="label"><i class="fa-solid fa-scale-balanced"></i>Net Balance (legacy)</div>
-          <div class="value" style="color: {{ '#16a34a' if net_balance >= 0 else '#dc2626' }};">
-            ${{ "%.2f"|format(net_balance) }}
-          </div>
-        </div>
-        <div class="stat">
-          <div class="label"><i class="fa-regular fa-calendar-check"></i>Total Monthly Budget</div>
-          <div class="value">${{ "%.2f"|format(total_monthly_budget) }}</div>
-        </div>
-        <div class="stat">
-          <div class="label"><i class="fa-solid fa-receipt"></i>Spent (this month)</div>
-          <div class="value">${{ "%.2f"|format(total_spent_month) }}</div>
-        </div>
-        <div class="stat">
-          <div class="label"><i class="fa-solid fa-wallet"></i>Remaining (this month)</div>
-          <div class="value">${{ "%.2f"|format(total_remaining_month) }}</div>
-        </div>
-      </section>
-
-      <!-- Columns -->
-      <section class="columns" aria-label="Content">
-        <!-- Expenses -->
-        <article class="card">
-          <div class="card-header">
-            <h2>Expenses</h2>
-            <button class="btn btn-primary btn-sm" onclick="openModal('expenseModal')">
-              <i class="fa-solid fa-plus"></i>&nbsp;Add Expense
-            </button>
-          </div>
-          <div class="card-body">
-            <div class="list">
-              {% if outcomes %}
-                {% for outcome in outcomes %}
-                <div class="item {{ outcome._status.lower().replace(' ', '-') }}">
-                  <div class="item-head">
-                    <div class="item-title">{{ outcome.name }}</div>
-                    <input type="number" class="num-inline cost" value="{{ outcome.cost }}" step="0.01"
-                      onchange="updateCost({{ outcome.id }}, this.value)" aria-label="Legacy cost for {{ outcome.name }}">
-                  </div>
-
-                  <div class="budget">
-                    <div>
-                      <div class="label">Monthly Limit</div>
-                      <input type="number" class="num-inline limit" value="{{ outcome.monthly_limit }}" step="0.01"
-                        onchange="updateMonthlyLimit({{ outcome.id }}, this.value)" aria-label="Monthly limit for {{ outcome.name }}">
-                    </div>
-                    <div>
-                      <div class="label">Spent ({{ current_year_month }})</div>
-                      <strong>${{ '%.2f'|format(outcome._spent_month) }}</strong>
-                    </div>
-                    <div>
-                      <div class="label">Remaining</div>
-                      <strong>${{ '%.2f'|format(outcome._remaining_month) }}</strong>
-                    </div>
-                    <div>
-                      <div class="label">Status</div>
-                      <span class="badge status">{{ outcome._status }}</span>
-                    </div>
-                    <div>
-                      <div class="label">Usage</div>
-                      {% if outcome._budget_state == 'ok' %}
-                        <span class="badge ok">OK</span>
-                      {% elif outcome._budget_state == 'near' %}
-                        <span class="badge near">NEAR</span>
-                      {% elif outcome._budget_state == 'over' %}
-                        <span class="badge over">OVER</span>
-                      {% else %}
-                        <span class="badge nolimit">NO LIMIT</span>
-                      {% endif %}
-                    </div>
-                  </div>
-
-                  <div class="progress {% if outcome._budget_state=='near' %}near{% elif outcome._budget_state=='over' %}over{% endif %}" aria-label="Usage progress">
-                    <div style="width: {{ '%.2f'|format(outcome._pct_capped) }}%"></div>
-                  </div>
-                  <div class="muted">Used {{ '%.2f'|format(outcome._pct_used) }}%</div>
-
-                  <div class="row">
-                    <!-- quick add transaction -->
-                    <form method="POST" action="{{ url_for('add_transaction') }}" class="row" style="gap:8px;">
-                      <input type="hidden" name="outcome_id" value="{{ outcome.id }}">
-                      <input type="number" name="amount" class="input" step="0.01" required placeholder="Amount (e.g., 48.00)" style="width:160px;">
-                      <input type="text" name="note" class="input" placeholder="Note (optional)" style="width:200px;">
-                      <button type="submit" class="btn btn-tonal btn-sm"><i class="fa-solid fa-plus"></i>&nbsp;Spend</button>
-                    </form>
-
-                    <!-- delete outcome -->
-                    <form method="POST" action="{{ url_for('delete_outcome', outcome_id=outcome.id) }}" onsubmit="return confirm('Delete this expense bucket? This also deletes its transactions.')" class="row">
-                      <button type="submit" class="btn btn-danger btn-sm"><i class="fa-solid fa-trash"></i></button>
-                    </form>
-                  </div>
-
-                  <!-- transactions (latest 5) -->
-                  <div>
-                    {% if outcome.transactions %}
-                      {% set txns = outcome.transactions | sort(attribute='id', reverse=true) %}
-                      {% for t in txns[:5] %}
-                      <div class="row" style="justify-content: space-between; border:1px solid var(--border); border-radius:10px; padding:8px 12px;">
-                        <div>
-                          <strong>${{ '%.2f'|format(t.amount) }}</strong>
-                          {% if t.note %}<span class="muted"> — {{ t.note }}</span>{% endif %}
-                          <div class="muted" style="font-size:12px;">{{ t.date }}</div>
-                        </div>
-                        <form method="POST" action="{{ url_for('delete_transaction', outcome_id=outcome.id, txn_id=t.id) }}" onsubmit="return confirm('Delete this spend entry?')">
-                          <button class="btn btn-danger btn-sm"><i class="fa-solid fa-trash"></i></button>
-                        </form>
-                      </div>
-                      {% endfor %}
-                      {% if outcome.transactions|length > 5 %}
-                        <div class="muted">Showing latest 5 of {{ outcome.transactions|length }} entries</div>
-                      {% endif %}
-                    {% else %}
-                      <div class="muted">No spend entries yet. Add your first transaction.</div>
-                    {% endif %}
-                  </div>
-                </div>
-                {% endfor %}
-              {% else %}
-                <div class="muted">No expenses recorded yet. Add your first expense to get started.</div>
-              {% endif %}
-            </div>
-          </div>
-        </article>
-
-        <!-- Income -->
-        <aside class="card">
-          <div class="card-header">
-            <h2>Income</h2>
-            <button class="btn btn-primary btn-sm" onclick="openModal('incomeModal')">
-              <i class="fa-solid fa-plus"></i>&nbsp;Add Income
-            </button>
-          </div>
-          <div class="card-body">
-            <div class="list">
-              {% if incomes %}
-                {% for income in incomes %}
-                <div class="item">
-                  <div class="item-head">
-                    <div class="item-title">{{ income.name }}</div>
-                    <input type="number" class="num-inline amount" value="{{ income.amount }}" step="0.01"
-                      onchange="updateIncomeAmount({{ income.id }}, this.value)" aria-label="Income amount for {{ income.name }}">
-                  </div>
-                  <div class="muted">Added: {{ income.date_added }}</div>
-                  <div class="row">
-                    <form method="POST" action="{{ url_for('delete_income', income_id=income.id) }}" onsubmit="return confirm('Delete this income?')">
-                      <button type="submit" class="btn btn-danger btn-sm"><i class="fa-solid fa-trash"></i></button>
-                    </form>
-                  </div>
-                </div>
-                {% endfor %}
-              {% else %}
-                <div class="muted">No income sources yet. Add one to track earnings.</div>
-              {% endif %}
-            </div>
-          </div>
-        </aside>
-      </section>
-
-      <!-- Modals -->
-      <section>
-        <!-- Add Expense Modal -->
-        <div id="expenseModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="expenseTitle">
-          <div class="modal-content">
-            <div class="modal-header">
-              <h3 id="expenseTitle" style="margin:0; font-size:16px; font-weight:700;">Add New Expense</h3>
-              <button class="close" onclick="closeModal('expenseModal')" aria-label="Close">&times;</button>
-            </div>
-            <form method="POST" action="{{ url_for('add_outcome') }}" class="list">
-              <div class="field">
-                <label class="label" for="expense-name">Expense Name</label>
-                <input type="text" id="expense-name" name="name" class="input" required placeholder="e.g., Groceries">
-              </div>
-              <div class="field">
-                <label class="label" for="expense-cost">Legacy Cost ($)</label>
-                <input type="number" id="expense-cost" name="cost" class="input" step="0.01" placeholder="0.00">
-                <span class="muted">Optional (kept for original totals)</span>
-              </div>
-              <div class="field">
-                <label class="label" for="expense-limit">Monthly Limit ($)</label>
-                <input type="number" id="expense-limit" name="monthly_limit" class="input" step="0.01" required placeholder="e.g., 150.00">
-              </div>
-              <div class="row" style="justify-content:flex-end;">
-                <button type="button" class="btn" onclick="closeModal('expenseModal')">Cancel</button>
-                <button type="submit" class="btn btn-primary">Add</button>
-              </div>
-            </form>
-          </div>
-        </div>
-
-        <!-- Add Income Modal -->
-        <div id="incomeModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="incomeTitle">
-          <div class="modal-content">
-            <div class="modal-header">
-              <h3 id="incomeTitle" style="margin:0; font-size:16px; font-weight:700;">Add New Income</h3>
-              <button class="close" onclick="closeModal('incomeModal')" aria-label="Close">&times;</button>
-            </div>
-            <form method="POST" action="{{ url_for('add_income') }}" class="list">
-              <div class="field">
-                <label class="label" for="income-name">Income Source</label>
-                <input type="text" id="income-name" name="name" class="input" required placeholder="e.g., Salary, Freelance">
-              </div>
-              <div class="field">
-                <label class="label" for="income-amount">Amount ($)</label>
-                <input type="number" id="income-amount" name="amount" class="input" step="0.01" required placeholder="0.00">
-              </div>
-              <div class="row" style="justify-content:flex-end;">
-                <button type="button" class="btn" onclick="closeModal('incomeModal')">Cancel</button>
-                <button type="submit" class="btn btn-primary">Add</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      </section>
-
-      <footer class="wrap" aria-label="Footer">
-        <div class="muted">© {{ current_year_month.split('-')[0] }} · Invoice Manager Pro</div>
-      </footer>
-    </div>
-  </main>
-
-  <script>
-    function openModal(id){ document.getElementById(id).style.display='block'; }
-    function closeModal(id){ document.getElementById(id).style.display='none'; }
-
-    function updateCost(outcomeId,cost){
-      fetch('/update_outcome_cost',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`outcome_id=${outcomeId}&cost=${cost}`})
-        .then(r=>r.json()).then(d=>{ if(d.success) setTimeout(()=>location.reload(),200); });
+    save_db(data)
+    return redirect(url_for("month_tracking", year=year, month=month))
+
+
+@app.post("/sections/activate")
+def activate_section():
+    data = load_db()
+    year = request.form.get("year") or now_year_month()[0]
+    month = request.form.get("month") or now_year_month()[1]
+    section_id = request.form.get("section_id", "")
+    section = section_by_id(data, section_id)
+    if section and section.get("priority") == "not_necessary":
+        activate_section_for_month(data, year, month, section_id)
+        flash(f"{section.get('name')} added only to {month} {year}.", "success")
+    else:
+        flash("This section cannot be added manually.", "error")
+    save_db(data)
+    return redirect(url_for("month_tracking", year=year, month=month))
+
+
+@app.post("/sections/budget")
+def set_month_budget():
+    # Kept only for compatibility with older forms/bookmarks.
+    # Budgets are now managed only from the Sections page.
+    flash("Budgets are edited only in the Sections page.", "error")
+    return redirect(url_for("sections"))
+
+
+@app.route("/sections")
+def sections():
+    data = load_db()
+    income_sections = [s for s in data.get("sections", []) if s.get("type") == "income"]
+    expense_sections = [s for s in data.get("sections", []) if s.get("type") == "expense"]
+    return render_template("sections.html", income_sections=income_sections, expense_sections=expense_sections)
+
+
+@app.post("/sections/add")
+def add_section():
+    data = load_db()
+    name = request.form.get("name", "").strip()
+    section_type = normalize_type(request.form.get("type", "expense"))
+    priority = request.form.get("priority", "necessary")
+    monthly_budget = money(request.form.get("monthly_budget"))
+    if not name:
+        flash("Section name is required.", "error")
+        return redirect(url_for("sections"))
+    section = {
+        "id": f"{section_type}-{new_id()}",
+        "name": name,
+        "type": section_type,
+        "priority": priority,
+        "monthly_budget": monthly_budget if section_type == "expense" else 0,
+        "system": False,
     }
+    data.setdefault("sections", []).append(section)
+    save_db(data)
+    flash(f"{name} section created.", "success")
+    return redirect(url_for("sections"))
 
-    function updateMonthlyLimit(outcomeId,limit){
-      fetch('/update_monthly_limit',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`outcome_id=${outcomeId}&monthly_limit=${limit}`})
-        .then(r=>r.json()).then(d=>{ if(d.success) setTimeout(()=>location.reload(),200); });
+
+@app.post("/sections/<section_id>/update")
+def update_section(section_id: str):
+    data = load_db()
+    section = section_by_id(data, section_id)
+    if section and not section.get("system"):
+        section["name"] = request.form.get("name", section.get("name", "")).strip() or section.get("name")
+        section["priority"] = request.form.get("priority", section.get("priority", "necessary"))
+        section["monthly_budget"] = money(request.form.get("monthly_budget")) if section.get("type") == "expense" else 0
+        flash("Section updated.", "success")
+    elif section and section.get("system"):
+        # System sections can still have default budgets edited if needed.
+        section["monthly_budget"] = money(request.form.get("monthly_budget")) if section.get("type") == "expense" else 0
+        flash("System section budget updated.", "success")
+    save_db(data)
+    return redirect(url_for("sections"))
+
+
+@app.post("/sections/<section_id>/delete")
+def delete_section(section_id: str):
+    data = load_db()
+    section = section_by_id(data, section_id)
+    if not section:
+        flash("Section not found.", "error")
+    elif section.get("system"):
+        flash("System sections cannot be deleted.", "error")
+    else:
+        data["sections"] = [s for s in data.get("sections", []) if s.get("id") != section_id]
+        flash("Section deleted. Old entries will keep their saved section name.", "success")
+    save_db(data)
+    return redirect(url_for("sections"))
+
+
+@app.route("/savings")
+def savings():
+    data = load_db()
+    year = request.args.get("year") or now_year_month()[0]
+    month = request.args.get("month") or now_year_month()[1]
+    ensure_month(data, year, month)
+    stats = calc_month(data, year, month)
+    expense_sections = sections_for_month(data, year, month, "expense")
+    history = sorted(data.get("savings_history", []), key=lambda x: x.get("date", ""), reverse=True)
+    saved_by_month = []
+    for m in MONTHS:
+        month_data = ensure_month(data, year, m)
+        saved_by_month.append(sum(money(x.get("amount")) for x in month_data.get("savings", []) if x.get("kind") == "add_from_monthly"))
+    save_db(data)
+    return render_template(
+        "savings.html",
+        data=data,
+        year=year,
+        month=month,
+        stats=stats,
+        expense_sections=expense_sections,
+        history=history,
+        savings_chart={"months": MONTHS, "saved": saved_by_month},
+    )
+
+
+@app.post("/savings/action")
+def savings_action():
+    data = load_db()
+    action = request.form.get("action", "add_from_monthly")
+    amount = money(request.form.get("amount"))
+    date = request.form.get("date") or today_iso()
+    year, month = date_to_year_month(date)
+    note = request.form.get("note", "")
+    if amount <= 0:
+        flash("Please enter an amount bigger than 0.", "error")
+        return redirect(url_for("savings"))
+
+    if action == "add_from_monthly":
+        data["savings_balance"] = round(money(data.get("savings_balance")) + amount, 2)
+        add_savings_history(data, year, month, "add_from_monthly", amount, note or "Moved money to savings", date)
+        flash("Money moved to savings.", "success")
+    elif action == "withdraw_to_month":
+        if amount > money(data.get("savings_balance")):
+            flash("You do not have enough savings for this withdrawal.", "error")
+            return redirect(url_for("savings"))
+        data["savings_balance"] = round(money(data.get("savings_balance")) - amount, 2)
+        add_savings_history(data, year, month, "withdraw_to_month", amount, note or "Withdrawn from savings", date)
+        flash("Money withdrawn from savings into this month.", "success")
+    elif action == "spend_from_savings":
+        section_id = request.form.get("section_id", "")
+        if amount > money(data.get("savings_balance")):
+            flash("You do not have enough savings for this expense.", "error")
+            return redirect(url_for("savings"))
+        section = section_by_id(data, section_id)
+        if not section or section.get("type") != "expense":
+            flash("Please choose a valid expense section.", "error")
+            return redirect(url_for("savings"))
+        create_entry(data, year, month, "expense", section_id, amount, note or section.get("name"), date, note, source="savings")
+        add_savings_history(data, year, month, "spend_from_savings", amount, note or f"Spent from savings: {section.get('name')}", date, section_id)
+        flash("Expense paid from savings.", "success")
+    elif action == "remove_from_savings":
+        if amount > money(data.get("savings_balance")):
+            flash("You cannot remove more than your current savings balance.", "error")
+            return redirect(url_for("savings"))
+        data["savings_balance"] = round(money(data.get("savings_balance")) - amount, 2)
+        add_savings_history(data, year, month, "remove_from_savings", amount, note or "Removed from savings", date)
+        flash("Savings removed from your balance.", "success")
+    save_db(data)
+    return redirect(url_for("savings", year=year, month=month))
+
+
+@app.route("/loans")
+def loans():
+    data = load_db()
+    refresh_all_loans(data)
+    year = request.args.get("year") or now_year_month()[0]
+    month = request.args.get("month") or now_year_month()[1]
+    stats = calc_month(data, year, month)
+    loans_sorted = sorted(data.get("loans", []), key=lambda l: l.get("date", ""), reverse=True)
+    save_db(data)
+    return render_template(
+        "loans.html",
+        loans=loans_sorted,
+        year=year,
+        month=month,
+        stats=stats,
+        total_remaining_loans=total_active_loan_remaining(data),
+    )
+
+
+@app.post("/loans/add")
+def add_loan():
+    data = load_db()
+    person = request.form.get("person", "").strip()
+    amount = money(request.form.get("amount"))
+    date = request.form.get("date") or today_iso()
+    description = request.form.get("description", "")
+    source = request.form.get("source", "monthly")
+    if not person or amount <= 0:
+        flash("Person and amount are required.", "error")
+        return redirect(url_for("loans"))
+
+    year, month = date_to_year_month(date)
+    if source == "savings" and amount > money(data.get("savings_balance")):
+        flash("You do not have enough savings to give this loan from savings.", "error")
+        return redirect(url_for("loans"))
+
+    loan = {
+        "id": new_id(),
+        "person": person,
+        "original_amount": amount,
+        "paid_amount": 0.0,
+        "remaining_amount": amount,
+        "date": date,
+        "description": description,
+        "source": source,
+        "status": "active",
+        "payments": [],
+        "created_at": datetime.now().isoformat(timespec="seconds"),
     }
+    data.setdefault("loans", []).append(loan)
+    ensure_month(data, year, month).setdefault("loans", []).append(loan["id"])
 
-    function updateIncomeAmount(incomeId,amount){
-      fetch('/update_income_amount',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:`income_id=${incomeId}&amount=${amount}`})
-        .then(r=>r.json()).then(d=>{ if(d.success) setTimeout(()=>location.reload(),200); });
+    # A loan given is real money going out. Add it as an expense automatically.
+    create_entry(
+        data,
+        year,
+        month,
+        "expense",
+        "expense-loan-given",
+        amount,
+        f"Loan to {person}",
+        date,
+        description,
+        source=source,
+        linked_type="loan_given",
+        linked_id=loan["id"],
+    )
+    flash(f"Loan added. {amount:.2f} was counted as money going out.", "success")
+    save_db(data)
+    return redirect(url_for("loans", year=year, month=month))
+
+
+@app.post("/loans/<loan_id>/payment")
+def receive_loan_payment(loan_id: str):
+    data = load_db()
+    loan = next((l for l in data.get("loans", []) if l.get("id") == loan_id), None)
+    if not loan:
+        flash("Loan not found.", "error")
+        return redirect(url_for("loans"))
+
+    refresh_loan(loan)
+    amount = money(request.form.get("amount"))
+    date = request.form.get("date") or today_iso()
+    description = request.form.get("description", "Loan money received")
+    if amount <= 0:
+        flash("Please enter a received amount bigger than 0.", "error")
+        return redirect(url_for("loans"))
+    if amount > money(loan.get("remaining_amount")):
+        flash("The received amount is bigger than the remaining loan.", "error")
+        return redirect(url_for("loans"))
+
+    year, month = date_to_year_month(date)
+    payment = {
+        "id": new_id(),
+        "amount": amount,
+        "date": date,
+        "description": description,
+        "year": year,
+        "month": month,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
     }
+    loan.setdefault("payments", []).append(payment)
 
-    // close modals by clicking backdrop
-    window.addEventListener('click', (e)=>{
-      const modals = document.querySelectorAll('.modal');
-      modals.forEach(m => { if(e.target === m){ m.style.display = 'none'; } });
-    });
-  </script>
-</body>
-</html>'''
+    # A loan return is real money coming in. Add it as income automatically.
+    income_entry = create_entry(
+        data,
+        year,
+        month,
+        "income",
+        "income-loan-return",
+        amount,
+        f"Loan return from {loan.get('person')}",
+        date,
+        description,
+        linked_type="loan_return",
+        linked_id=loan_id,
+    )
+    payment["income_entry_id"] = income_entry["id"]
+    refresh_loan(loan)
+    flash("Loan payment received and added as monthly income.", "success")
+    save_db(data)
+    return redirect(url_for("loans", year=year, month=month))
 
-    # WRITE UTF-8 to avoid UnicodeDecodeError on Windows
-    with open('templates/dashboard.html', 'w', encoding='utf-8') as f:
-        f.write(template_content)
 
-    print("✅ UI refreshed: minimalist design (Inter, neutral base + primary + accent).")
-    print("✅ Auto status from spending (Pending/In Course/Paid/Over).")
-    print("✅ Monthly budgets, transactions, inline edits, responsive layout.")
-    print("➡  Run: 1) pip install flask  2) python app.py  3) http://localhost:5000")
+@app.post("/loans/<loan_id>/delete")
+def delete_loan(loan_id: str):
+    data = load_db()
+    data["loans"] = [l for l in data.get("loans", []) if l.get("id") != loan_id]
+    for months in data.get("years", {}).values():
+        for month_data in months.values():
+            if loan_id in month_data.get("loans", []):
+                month_data["loans"].remove(loan_id)
+    flash("Loan record deleted. Existing linked income/expense entries are not deleted automatically.", "success")
+    save_db(data)
+    return redirect(url_for("loans"))
 
+
+@app.route("/goals")
+def goals():
+    data = load_db()
+    goals_sorted = sorted(data.get("goals", []), key=lambda g: g.get("created_at", ""), reverse=True)
+    return render_template("goals.html", goals=goals_sorted, savings_balance=money(data.get("savings_balance")))
+
+
+@app.post("/goals/add")
+def add_goal():
+    data = load_db()
+    name = request.form.get("name", "").strip()
+    target_price = money(request.form.get("target_price"))
+    description = request.form.get("description", "")
+    if not name or target_price <= 0:
+        flash("Goal name and price are required.", "error")
+        return redirect(url_for("goals"))
+    data.setdefault("goals", []).append({
+        "id": new_id(),
+        "name": name,
+        "target_price": target_price,
+        "description": description,
+        "status": "active",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_db(data)
+    flash("Goal created.", "success")
+    return redirect(url_for("goals"))
+
+
+@app.post("/goals/<goal_id>/complete")
+def complete_goal(goal_id: str):
+    data = load_db()
+    for goal in data.get("goals", []):
+        if goal.get("id") == goal_id:
+            goal["status"] = "completed"
+            goal["completed_at"] = datetime.now().isoformat(timespec="seconds")
+            flash("Goal marked as completed.", "success")
+            break
+    save_db(data)
+    return redirect(url_for("goals"))
+
+
+@app.post("/goals/<goal_id>/delete")
+def delete_goal(goal_id: str):
+    data = load_db()
+    data["goals"] = [g for g in data.get("goals", []) if g.get("id") != goal_id]
+    save_db(data)
+    flash("Goal deleted.", "success")
+    return redirect(url_for("goals"))
+
+
+@app.route("/export")
+def export_data():
+    data = load_db()
+    save_db(data)
+    return send_file(DATA_FILE, as_attachment=True, download_name="budgify-export.json")
+
+
+@app.route("/backup")
+def backup_data():
+    data = load_db()
+    save_db(data)
+    BACKUP_DIR.mkdir(exist_ok=True)
+    backup_path = BACKUP_DIR / f"budgify-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    shutil.copy2(DATA_FILE, backup_path)
+    flash(f"Backup created: {backup_path.name}", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+if __name__ == "__main__":
     app.run(debug=True)
